@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>rustic dnf repo ({{OWNER}} fork)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 720px; margin: 3rem auto; padding: 0 1.5rem; color: #222; line-height: 1.55; }
+  h1 { margin-bottom: 0.25rem; }
+  p.sub { color: #666; margin-top: 0; }
+  pre { background: #f4f4f4; padding: 1rem; border-radius: 6px; overflow-x: auto; font-size: 0.9rem; }
+  code { background: #f4f4f4; padding: 0.1rem 0.3rem; border-radius: 3px; font-size: 0.9rem; }
+  a { color: #0969da; }
+</style>
+</head>
+<body>
+<h1>rustic dnf repo</h1>
+<p class="sub">Fork: <a href="https://github.com/{{OWNER}}/rustic">{{OWNER}}/rustic</a> — updated on every push to <code>main</code>.</p>
+
+<h2>Install on Fedora</h2>
+<pre><code>sudo dnf config-manager addrepo --from-repofile={{BASE_URL}}/rustic.repo
+sudo dnf install rustic</code></pre>
+
+<h2>Update</h2>
+<pre><code>sudo dnf upgrade rustic</code></pre>
+
+<h2>Repository</h2>
+<ul>
+  <li><a href="./fedora/x86_64/">fedora/x86_64/</a></li>
+  <li><a href="./fedora/aarch64/">fedora/aarch64/</a></li>
+  <li><a href="./rustic.repo">rustic.repo</a></li>
+</ul>
+
+<p class="sub">RPMs are unsigned (<code>gpgcheck=0</code>). Built: {{BUILD_TIMESTAMP}}.</p>
+</body>
+</html>

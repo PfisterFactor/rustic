@@ -1,0 +1,217 @@
+name: Fedora RPM
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  FEDORA_IMAGE: "fedora:41"
+
+permissions:
+  contents: write
+  pages: write
+
+jobs:
+  build-rpm:
+    name: Build RPM (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rpm-${{ matrix.arch }}
+
+      - name: Install apt build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config ca-certificates
+
+      - name: Build release binary
+        run: |
+          PROJECT_VERSION=$(git describe --tags --always) cargo build --release --locked
+          strip target/release/rustic
+          ls -lh target/release/rustic
+
+      - name: Stage RPM sources
+        run: |
+          mkdir -p packaging/rpm/sources
+          cp target/release/rustic packaging/rpm/sources/rustic
+          cp LICENSE-APACHE       packaging/rpm/sources/LICENSE-APACHE
+          cp LICENSE-MIT          packaging/rpm/sources/LICENSE-MIT
+          ls -lh packaging/rpm/sources/
+
+      - name: Compute build metadata
+        id: meta
+        run: |
+          VERSION=$(grep -E '^version\s*=' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          BUILDNUM=$(date -u +%s)
+          SHORTSHA=${GITHUB_SHA::7}
+          echo "version=${VERSION}"   >> "$GITHUB_OUTPUT"
+          echo "buildnum=${BUILDNUM}" >> "$GITHUB_OUTPUT"
+          echo "shortsha=${SHORTSHA}" >> "$GITHUB_OUTPUT"
+          echo "Building ${VERSION}-0.${BUILDNUM}.git${SHORTSHA}"
+
+      - name: Build RPM in Fedora container
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" -w /work \
+            -e RPM_VERSION="${{ steps.meta.outputs.version }}" \
+            -e RPM_BUILDNUM="${{ steps.meta.outputs.buildnum }}" \
+            -e RPM_SHORTSHA="${{ steps.meta.outputs.shortsha }}" \
+            -e GH_OWNER="${{ github.repository_owner }}" \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            "${FEDORA_IMAGE}" \
+            bash packaging/rpm/build-rpm.sh
+
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.arch }}
+          path: packaging/rpm/out/*.rpm
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish rolling Release
+    needs: build-rpm
+    runs-on: ubuntu-latest
+    concurrency:
+      group: rpm-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download RPM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: rpms
+          pattern: rpm-*
+          merge-multiple: true
+
+      - name: Upsert main-latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NOTES="Rolling build from \`main\` @ \`${GITHUB_SHA::7}\` — $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+          if gh release view main-latest >/dev/null 2>&1; then
+            gh release view main-latest --json assets --jq '.assets[].name' \
+              | while read -r n; do
+                  case "$n" in *.rpm) gh release delete-asset main-latest "$n" --yes ;; esac
+                done
+            gh release edit main-latest --prerelease --title "Rolling main build" --notes "${NOTES}"
+          else
+            gh release create main-latest --prerelease \
+              --title "Rolling main build" --notes "${NOTES}" --target "${GITHUB_SHA}"
+          fi
+          gh release upload main-latest rpms/*.rpm
+
+  publish-pages:
+    name: Publish dnf repo to gh-pages
+    needs: build-rpm
+    runs-on: ubuntu-latest
+    concurrency:
+      group: rpm-pages
+      cancel-in-progress: false
+    steps:
+      - name: Checkout gh-pages (or init)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git clone --depth 1 --branch gh-pages \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" site 2>/dev/null \
+          || {
+            echo "gh-pages missing — initialising a fresh orphan branch"
+            git clone "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" site
+            cd site
+            git checkout --orphan gh-pages
+            git rm -rf . >/dev/null 2>&1 || true
+            touch .nojekyll
+            git add .nojekyll
+            git commit -m "init gh-pages"
+          }
+
+      - name: Checkout source (for templates)
+        uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Download RPM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: new-rpms
+          pattern: rpm-*
+
+      - name: Stage RPMs into site
+        run: |
+          set -euo pipefail
+          for arch in x86_64 aarch64; do
+            mkdir -p "site/fedora/$arch"
+            if ls "new-rpms/rpm-$arch"/*.rpm >/dev/null 2>&1; then
+              cp -v "new-rpms/rpm-$arch"/*.rpm "site/fedora/$arch/"
+            fi
+          done
+          touch site/.nojekyll
+
+      - name: Generate dnf metadata (createrepo_c)
+        run: |
+          docker run --rm -v "$PWD/site:/s" -w /s "${FEDORA_IMAGE}" bash -c '
+            set -euo pipefail
+            dnf install -y --setopt=install_weak_deps=False createrepo_c >/dev/null
+            for arch in x86_64 aarch64; do
+              [ -d "/s/fedora/$arch" ] || continue
+              if [ -d "/s/fedora/$arch/repodata" ]; then
+                createrepo_c --update "/s/fedora/$arch"
+              else
+                createrepo_c "/s/fedora/$arch"
+              fi
+            done
+          '
+          sudo chown -R "$(id -u):$(id -g)" site
+
+      - name: Render .repo and index.html from templates
+        run: |
+          set -euo pipefail
+          OWNER_L="${GITHUB_REPOSITORY_OWNER,,}"
+          REPO_N="${GITHUB_REPOSITORY##*/}"
+          BASE_URL="https://${OWNER_L}.github.io/${REPO_N}"
+          BUILD_TS="$(date -u '+%Y-%m-%d %H:%M:%SZ')"
+          sed -e "s|{{BASE_URL}}|${BASE_URL}|g" \
+              -e "s|{{OWNER}}|${GITHUB_REPOSITORY_OWNER}|g" \
+              src/packaging/rpm/rustic.repo.template > site/rustic.repo
+          sed -e "s|{{BASE_URL}}|${BASE_URL}|g" \
+              -e "s|{{OWNER}}|${GITHUB_REPOSITORY_OWNER}|g" \
+              -e "s|{{BUILD_TIMESTAMP}}|${BUILD_TS}|g" \
+              src/packaging/rpm/index.html.template > site/index.html
+          cat site/rustic.repo
+
+      - name: Commit and push gh-pages
+        run: |
+          set -euo pipefail
+          cd site
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes."
+          else
+            git commit -m "publish rpm repo @ ${GITHUB_SHA::7}"
+            git push origin gh-pages
+          fi
