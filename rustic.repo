@@ -1,0 +1,6 @@
+[rustic]
+name=rustic (fork: PfisterFactor)
+baseurl=https://pfisterfactor.github.io/rustic/fedora/$basearch
+enabled=1
+gpgcheck=0
+metadata_expire=1h
