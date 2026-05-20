@@ -1,0 +1,168 @@
+# syntax=docker/dockerfile:1.7
+#
+# Hardened Fedora-based container for rustic.
+#
+# Four stages:
+#   builder        : compile rustic with the documented feature set
+#   tester         : run packaging/podman/tests against the freshly built binary
+#   runtime-rootfs : assemble the final userspace into /rootfs and verify it
+#   runtime        : FROM scratch; copies /rootfs and nothing else
+#
+# Nothing from the upstream Fedora layers reaches the final image; the only
+# things in the runtime stage are the contents of /rootfs assembled (and
+# audited) in the runtime-rootfs stage.
+#
+# See packaging/podman/README.md for usage and packaging/podman/entrypoint-notes.md
+# for the rationale.
+
+ARG RUST_TOOLCHAIN=1.88.0
+# Pin the base images by manifest digest so tag drift cannot silently change
+# what the publish stage actually rebuilds. The digests point at the OCI image
+# *index* (multi-arch) so amd64 and arm64 are both pulled from the same root.
+# Update both digests whenever you intentionally rebase onto a newer Fedora.
+ARG FEDORA_IMAGE=registry.fedoraproject.org/fedora@sha256:d1c91daf00c5deda8cb5dc6a29370e8b8cf2cfe354ce9d9807d794b43ece7e48
+ARG FEDORA_MINIMAL_IMAGE=registry.fedoraproject.org/fedora-minimal@sha256:9665b73c7812a24c7413cec478b71da21622da2536a4a0b5ebbabaa6cea8ef98
+ARG FEDORA_RELEASEVER=44
+ARG RUSTIC_FEATURES=jq,prometheus,opentelemetry,tui,webdav,mount,mimalloc
+
+############ builder ############
+FROM ${FEDORA_IMAGE} AS builder
+ARG RUST_TOOLCHAIN
+ARG RUSTIC_FEATURES
+RUN dnf5 -y --setopt=install_weak_deps=False install \
+        gcc gcc-c++ make pkgconf-pkg-config openssl-devel fuse3-devel \
+        clang-devel libstdc++-devel ca-certificates git xz tar gzip curl \
+    && dnf5 clean all
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.3 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --default-toolchain "${RUST_TOOLCHAIN}" --profile minimal \
+    && rustc --version
+WORKDIR /src
+COPY . .
+RUN cargo build --release --locked --no-default-features --features "${RUSTIC_FEATURES}" \
+    && strip target/release/rustic \
+    && install -Dm0755 target/release/rustic /out/usr/local/bin/rustic \
+    && /out/usr/local/bin/rustic --version \
+    && ! ldd /out/usr/local/bin/rustic | grep -F 'not found'
+
+############ tester ############
+FROM ${FEDORA_MINIMAL_IMAGE} AS tester
+# microdnf is what fedora-minimal ships; dnf5 is also pre-installed on F44+.
+# Use dnf5 so we share syntax with the other stages.
+RUN dnf5 install -y --setopt=install_weak_deps=False \
+        bash coreutils diffutils findutils tar gzip jq curl python3 \
+        ca-certificates fuse3-libs tzdata shadow-utils procps-ng \
+    && dnf5 clean all
+COPY --from=builder /out/usr/local/bin/rustic /usr/local/bin/rustic
+COPY packaging/podman/tests /opt/rustic-tests
+RUN groupadd --system --gid 65532 rustic \
+    && useradd --system --uid 65532 --gid 65532 \
+               --home-dir /var/lib/rustic --no-create-home \
+               --shell /sbin/nologin rustic \
+    && chown -R 65532:65532 /opt/rustic-tests \
+    && install -d -o 65532 -g 65532 /work /var/lib/rustic /var/cache/rustic
+USER 65532:65532
+ENV HOME=/var/lib/rustic \
+    XDG_CACHE_HOME=/var/cache/rustic \
+    RUSTIC_TEST_TMP=/work
+WORKDIR /work
+RUN bash /opt/rustic-tests/run.sh \
+    && touch /var/lib/rustic/TESTS_PASSED
+
+############ runtime-rootfs ############
+# Assemble the final userspace into /rootfs by selectively copying files
+# rustic actually needs. We deliberately do NOT use `dnf5 --installroot`:
+# the dependency closure of glibc / ca-certificates on Fedora 44 drags
+# `bash`, `coreutils`, `shadow-utils`, etc. into the rootfs via the
+# `filesystem`/`setup` packages. The hardened image must ship nothing
+# beyond rustic's actual runtime closure, so we lay it down by hand.
+FROM ${FEDORA_IMAGE} AS runtime-rootfs
+# Install the source-side packages we want to *extract files from*. They
+# stay in the build stage's `/`, not in the assembled `/rootfs`.
+RUN dnf5 -y --setopt=install_weak_deps=False install \
+        ca-certificates tzdata glibc libgcc fuse3-libs \
+    && dnf5 clean all
+# Gate the rootfs assembly on a green tester run.
+COPY --from=tester /var/lib/rustic/TESTS_PASSED /tmp/TESTS_PASSED
+COPY --from=builder /out/usr/local/bin/rustic /tmp/rustic
+COPY LICENSE-APACHE LICENSE-MIT /tmp/licenses/
+COPY packaging/podman/tests/cases/900_runtime_rootfs_contract.sh /usr/local/bin/rootfs-contract
+RUN set -eu \
+    && mkdir -p /rootfs/usr/local/bin \
+                /rootfs/usr/share/licenses/rustic \
+                /rootfs/etc /rootfs/etc/ssl/certs \
+                /rootfs/etc/pki/ca-trust/extracted/pem \
+                /rootfs/etc/pki/ca-trust/extracted/openssl \
+                /rootfs/etc/pki/tls/certs \
+                /rootfs/usr/share/zoneinfo \
+                /rootfs/lib /rootfs/lib64 \
+                /rootfs/usr/lib /rootfs/usr/lib64 \
+                /rootfs/work /rootfs/var/lib/rustic /rootfs/var/cache/rustic \
+    && install -m 0755 /tmp/rustic /rootfs/usr/local/bin/rustic \
+    && install -m 0644 /tmp/licenses/LICENSE-APACHE /rootfs/usr/share/licenses/rustic/LICENSE-APACHE \
+    && install -m 0644 /tmp/licenses/LICENSE-MIT    /rootfs/usr/share/licenses/rustic/LICENSE-MIT \
+    # ---- ldd closure of rustic ----
+    # Capture every needed shared object and the dynamic linker, then copy
+    # each into the matching path inside /rootfs. We follow symlinks once
+    # with `cp -L` so the rootfs holds real files, not a chain that points
+    # outside it.
+    && libs="$(ldd /rootfs/usr/local/bin/rustic | awk '/=>/{print $3} /ld-linux/{print $1}' | sort -u)" \
+    && for lib in ${libs}; do \
+           case "${lib}" in /*) ;; *) continue ;; esac; \
+           [ -e "${lib}" ] || { echo "missing ldd dep: ${lib}" >&2; exit 1; }; \
+           dest="/rootfs${lib}"; \
+           mkdir -p "$(dirname "${dest}")"; \
+           cp -L "${lib}" "${dest}"; \
+           chmod 0755 "${dest}"; \
+       done \
+    # ---- CA bundle (rustls + native_roots reads these) ----
+    && cp -L /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+             /rootfs/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+    && cp -L /etc/pki/ca-trust/extracted/openssl/ca-bundle.trust.crt \
+             /rootfs/etc/pki/ca-trust/extracted/openssl/ca-bundle.trust.crt \
+    && ln -s /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /rootfs/etc/ssl/certs/ca-bundle.crt \
+    && ln -s /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /rootfs/etc/ssl/cert.pem \
+    && ln -s /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /rootfs/etc/pki/tls/certs/ca-bundle.crt \
+    # ---- tzdata ----
+    && cp -rL /usr/share/zoneinfo/. /rootfs/usr/share/zoneinfo/ \
+    # ---- /etc/passwd, /etc/group, minimal nsswitch ----
+    && printf 'root:x:0:0:root:/root:/sbin/nologin\nrustic:x:65532:65532:rustic:/var/lib/rustic:/sbin/nologin\n' > /rootfs/etc/passwd \
+    && printf 'root:x:0:\nrustic:x:65532:\n' > /rootfs/etc/group \
+    && printf 'passwd: files\ngroup: files\nhosts: files dns\n' > /rootfs/etc/nsswitch.conf \
+    && chown -R 65532:65532 /rootfs/work /rootfs/var/lib/rustic /rootfs/var/cache/rustic \
+    && chmod 0750 /rootfs/work /rootfs/var/lib/rustic /rootfs/var/cache/rustic \
+    # ---- safety nets ----
+    # Kill setuid/setgid bits anywhere under the rootfs.
+    && find /rootfs -xdev -perm /6000 -type f -print -delete \
+    # Verify the binary actually runs against the assembled closure (no shell
+    # required inside the rootfs — chroot invokes /usr/local/bin/rustic
+    # directly, which the kernel resolves through the rootfs's ld-linux*).
+    && chroot /rootfs /usr/local/bin/rustic --version \
+    # Hard-fail if any forbidden file leaked into the rootfs.
+    && bash /usr/local/bin/rootfs-contract /rootfs
+
+############ runtime ############
+FROM scratch AS runtime
+ARG VCS_REF
+ARG BUILD_DATE
+ARG VERSION
+ARG FEDORA_MINIMAL_IMAGE
+LABEL org.opencontainers.image.title="rustic" \
+      org.opencontainers.image.description="Hardened Fedora-based rustic image" \
+      org.opencontainers.image.source="https://github.com/PfisterFactor/rustic" \
+      org.opencontainers.image.url="https://github.com/PfisterFactor/rustic" \
+      org.opencontainers.image.documentation="https://github.com/PfisterFactor/rustic/blob/main/packaging/podman/README.md" \
+      org.opencontainers.image.licenses="Apache-2.0 OR MIT" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.base.name="${FEDORA_MINIMAL_IMAGE}" \
+      org.opencontainers.image.vendor="PfisterFactor"
+COPY --from=runtime-rootfs /rootfs/ /
+USER 65532:65532
+ENV HOME=/var/lib/rustic \
+    XDG_CACHE_HOME=/var/cache/rustic
+WORKDIR /work
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/rustic"]
+CMD ["--help"]

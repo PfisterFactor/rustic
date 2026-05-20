@@ -1,0 +1,16 @@
+# Minimal rustic profile used by cases/120_show_config.sh.
+#
+# This file exercises the [global] + [repository] sections through the
+# profile loader; the case asserts that `rustic show-config` echoes
+# specific values it set here.
+
+[global]
+log-level = "warn"
+
+[repository]
+repository = "/tmp/rustic-tests-show-config"
+password = "rustic-tests-password"
+no-cache = true
+
+[snapshot-filter]
+filter-hosts = ["test-host-fixture"]

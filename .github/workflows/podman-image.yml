@@ -1,0 +1,448 @@
+name: Hardened Podman Image
+
+# Builds, tests, scans, signs, and publishes a hardened Fedora-based rustic
+# image to GHCR as `ghcr.io/<owner>/rustic-hardened`. The runtime stage is
+# `FROM scratch` and is only produced after an embedded integration test
+# suite passes inside the build. See packaging/podman/README.md and
+# packaging/podman/entrypoint-notes.md for the operator-facing details.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "packaging/podman/**"
+      - ".github/workflows/podman-image.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+  workflow_dispatch:
+
+concurrency:
+  group: podman-image-${{ github.ref }}
+  cancel-in-progress: true
+
+# Default to the smallest possible permission set; jobs that need more
+# request it explicitly.
+permissions:
+  contents: read
+
+env:
+  # OCI reference syntax requires a lowercase owner; the fork's GitHub
+  # owner is PfisterFactor, so hard-code the lowercase form here. Adjust
+  # if this workflow is reused for a fork under a different owner.
+  IMAGE_NAME: ghcr.io/pfisterfactor/rustic-hardened
+  CONTAINERFILE: packaging/podman/Containerfile
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 1: build the image locally (no push), run the runtime-rootfs contract
+  # against the produced rootfs. Matrix on amd64 + arm64. arm64 uses the
+  # native runner where available; falls back to QEMU via setup-qemu-action
+  # for any other arch.
+  # ---------------------------------------------------------------------------
+  build-test-local:
+    name: Build + test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+            need_qemu: false
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            need_qemu: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+
+      - name: Set up QEMU (cross-arch only)
+        if: matrix.need_qemu
+        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - name: Cache cargo + rustup state for the builder stage
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          file: ${{ env.CONTAINERFILE }}
+          target: runtime
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: false
+          outputs: type=oci,dest=${{ runner.temp }}/image.tar
+          cache-from: type=gha,scope=rustic-hardened-${{ matrix.arch }}
+          cache-to: type=gha,scope=rustic-hardened-${{ matrix.arch }},mode=max
+
+      - name: Install skopeo + umoci for OCI archive extraction
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends skopeo umoci jq
+          skopeo --version
+          umoci --version
+
+      - name: Unpack OCI archive and verify rootfs contract
+        env:
+          IMAGE_TAR: ${{ runner.temp }}/image.tar
+          ROOTFS_DIR: ${{ runner.temp }}/rootfs
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/oci-layout"
+          # `skopeo copy` from the OCI archive into a directory layout that
+          # umoci can unpack. The archive contains a single image (single-arch
+          # build per matrix leg).
+          skopeo copy --quiet \
+            "oci-archive:${IMAGE_TAR}" \
+            "oci:${RUNNER_TEMP}/oci-layout:rustic-hardened-test"
+          # umoci unpacks the OCI image into a real rootfs we can inspect.
+          # `--rootless` avoids needing real CAP_SYS_ADMIN on the runner.
+          umoci unpack --rootless --image \
+            "${RUNNER_TEMP}/oci-layout:rustic-hardened-test" \
+            "${RUNNER_TEMP}/unpacked"
+          MOUNT_ROOT="${RUNNER_TEMP}/unpacked/rootfs"
+          echo "rootfs unpacked at: ${MOUNT_ROOT}"
+          ls -la "${MOUNT_ROOT}"
+          bash packaging/podman/tests/cases/900_runtime_rootfs_contract.sh "${MOUNT_ROOT}"
+
+      - name: Upload OCI image archive for downstream debugging
+        if: failure()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: image-${{ matrix.arch }}
+          path: ${{ runner.temp }}/image.tar
+          if-no-files-found: warn
+          retention-days: 3
+
+  # ---------------------------------------------------------------------------
+  # Stage 2a: per-arch build + push by digest. Each leg runs on a native
+  # runner for its arch (no QEMU emulation), so the slow Rust LTO link
+  # happens at native speed. Pushed image references are digest-only —
+  # the human-friendly tag list is attached by the manifest job below.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish ${{ matrix.arch }} to GHCR
+    if: github.event_name != 'pull_request'
+    needs: build-test-local
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute build date
+        id: date
+        run: echo "value=$(date -u +%FT%TZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push by digest (${{ matrix.arch }})
+        id: build
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          file: ${{ env.CONTAINERFILE }}
+          target: runtime
+          platforms: ${{ matrix.platform }}
+          push: true
+          provenance: mode=max
+          sbom: true
+          # Push by digest only; the multi-arch manifest job below assigns
+          # the human-readable tags atomically across both arches.
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.title=rustic
+            org.opencontainers.image.description=Hardened Fedora-based rustic image
+            org.opencontainers.image.licenses=Apache-2.0 OR MIT
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.documentation=https://github.com/${{ github.repository }}/blob/main/packaging/podman/README.md
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ steps.date.outputs.value }}
+          cache-from: type=gha,scope=rustic-hardened-${{ matrix.arch }}
+          cache-to: type=gha,scope=rustic-hardened-${{ matrix.arch }},mode=max
+
+      - name: Stage digest for manifest assembly
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/digests"
+          # The filename is the bare digest (sha256:...); contents are empty.
+          # The manifest job reads filenames to compose `imagetools create`.
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+          echo "${DIGEST}" > "${RUNNER_TEMP}/digests/${DIGEST#sha256:}.full"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: rustic-hardened-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Stage 2b: stitch the per-arch digests into a multi-arch manifest list
+  # tagged for humans (`latest`, `vX.Y.Z`, `sha-<short>`, `main`).
+  # ---------------------------------------------------------------------------
+  publish-manifest:
+    name: Assemble multi-arch manifest
+    if: github.event_name != 'pull_request'
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
+      image_ref: ${{ steps.manifest.outputs.image_ref }}
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tag set
+        id: meta
+        uses: docker/metadata-action@8e5442c4ef9f78752691e2d8f8d19755c6f78e81 # v5.5.1
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Download per-arch digest artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: rustic-hardened-digest-*
+          merge-multiple: true
+
+      - name: Create manifest list and resolve final digest
+        id: manifest
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          # Build the arg list: each entry is `<image>@<digest>` for one arch.
+          refs=()
+          for f in ./*.full; do
+              digest="$(cat -- "$f")"
+              refs+=("${IMAGE_NAME}@${digest}")
+          done
+          if (( ${#refs[@]} == 0 )); then
+              echo "::error::no per-arch digests found"
+              exit 1
+          fi
+          # Build the tag argument list: docker buildx imagetools create
+          # takes one `--tag T` per tag.
+          tag_args=()
+          while IFS= read -r t; do
+              [[ -z "$t" ]] && continue
+              tag_args+=(--tag "$t")
+          done <<< "${TAGS}"
+          if (( ${#tag_args[@]} == 0 )); then
+              echo "::error::no tags produced by metadata-action"
+              exit 1
+          fi
+          echo "Creating manifest list with refs: ${refs[*]}"
+          echo "Tags: ${tag_args[*]}"
+          docker buildx imagetools create "${tag_args[@]}" "${refs[@]}"
+          # Resolve the digest of the (now-immutable) manifest list. Pick any
+          # of the tags; they all point at the same digest.
+          primary_tag="$(printf '%s\n' "${TAGS}" | head -n1)"
+          final_digest="$(docker buildx imagetools inspect --raw "${primary_tag}" \
+              | sha256sum | awk '{print "sha256:"$1}')"
+          echo "digest=${final_digest}"            >> "$GITHUB_OUTPUT"
+          echo "image_ref=${IMAGE_NAME}@${final_digest}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Stage 3a: Trivy scan against the pushed digest. Fails on HIGH or CRITICAL.
+  # ---------------------------------------------------------------------------
+  scan:
+    name: Trivy scan
+    if: github.event_name != 'pull_request'
+    needs: publish-manifest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: ${{ needs.publish-manifest.outputs.image_ref }}
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+
+  # ---------------------------------------------------------------------------
+  # Stage 3b: Generate SPDX SBOM from the pushed digest, sign the image and
+  # attach the SBOM as a cosign attestation. Verifies its own work before
+  # exiting.
+  # ---------------------------------------------------------------------------
+  sbom-attest-sign:
+    name: SBOM + cosign attest + sign
+    if: github.event_name != 'pull_request'
+    needs: publish-manifest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+
+      - name: Generate SPDX SBOM (Syft) from the pushed digest
+        uses: anchore/sbom-action@fc46e51fd3cb168ffb36c6d1915723c47db58abb # v0.17.7
+        with:
+          image: ${{ needs.publish-manifest.outputs.image_ref }}
+          format: spdx-json
+          output-file: ${{ runner.temp }}/sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Log in to GHCR for cosign push of attestations
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: cosign sign (keyless via OIDC)
+        env:
+          COSIGN_YES: "true"
+          IMAGE_REF: ${{ needs.publish-manifest.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE_REF}"
+
+      - name: cosign attest --type spdxjson
+        env:
+          COSIGN_YES: "true"
+          IMAGE_REF: ${{ needs.publish-manifest.outputs.image_ref }}
+          SBOM_PATH: ${{ runner.temp }}/sbom.spdx.json
+        run: |
+          set -euo pipefail
+          cosign attest --yes --type spdxjson \
+            --predicate "${SBOM_PATH}" \
+            "${IMAGE_REF}"
+
+      - name: Verify signature + attestation
+        env:
+          IMAGE_REF: ${{ needs.publish-manifest.outputs.image_ref }}
+          EXPECTED_ISSUER: "https://token.actions.githubusercontent.com"
+          # Lock identity to this exact workflow file on this repo.
+          EXPECTED_IDENTITY: "^https://github\\.com/${{ github.repository }}/\\.github/workflows/podman-image\\.yml@.+$"
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+            --certificate-identity-regexp "${EXPECTED_IDENTITY}" \
+            "${IMAGE_REF}" > /dev/null
+          cosign verify-attestation --type spdxjson \
+            --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+            --certificate-identity-regexp "${EXPECTED_IDENTITY}" \
+            "${IMAGE_REF}" > /dev/null
+
+      - name: Upload SBOM as build artifact
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: sbom-spdx-json
+          path: ${{ runner.temp }}/sbom.spdx.json
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Final aggregator job for branch-protection rules: every required job must
+  # have succeeded for `result` to succeed. PR runs only need build-test-local.
+  # ---------------------------------------------------------------------------
+  result:
+    name: Result
+    if: always()
+    needs: [build-test-local, publish, publish-manifest, scan, sbom-attest-sign]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs succeeded
+        env:
+          BTL_RESULT: ${{ needs.build-test-local.result }}
+          PUB_RESULT: ${{ needs.publish.result }}
+          MAN_RESULT: ${{ needs.publish-manifest.result }}
+          SCAN_RESULT: ${{ needs.scan.result }}
+          SBOM_RESULT: ${{ needs.sbom-attest-sign.result }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          echo "build-test-local : ${BTL_RESULT}"
+          echo "publish          : ${PUB_RESULT}"
+          echo "publish-manifest : ${MAN_RESULT}"
+          echo "scan             : ${SCAN_RESULT}"
+          echo "sbom-attest-sign : ${SBOM_RESULT}"
+          # build-test-local is required on every event.
+          if [[ "${BTL_RESULT}" != "success" ]]; then
+            echo "::error::build-test-local did not succeed"
+            exit 1
+          fi
+          # publish/scan/sbom-attest-sign are skipped on PR runs by design.
+          if [[ "${EVENT}" != "pull_request" ]]; then
+            for r in "${PUB_RESULT}" "${MAN_RESULT}" "${SCAN_RESULT}" "${SBOM_RESULT}"; do
+              if [[ "${r}" != "success" ]]; then
+                echo "::error::a downstream publish/scan/sign job did not succeed: ${r}"
+                exit 1
+              fi
+            done
+          else
+            for r in "${PUB_RESULT}" "${MAN_RESULT}" "${SCAN_RESULT}" "${SBOM_RESULT}"; do
+              if [[ "${r}" != "skipped" && "${r}" != "success" ]]; then
+                echo "::error::publish-side job had unexpected result on PR: ${r}"
+                exit 1
+              fi
+            done
+          fi
+          echo "all required jobs are green"

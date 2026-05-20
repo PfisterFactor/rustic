@@ -1,0 +1,25 @@
+# hooks.toml — referenced by packaging/podman/tests/cases/180_hooks.sh.
+#
+# RUSTIC_SENTINEL_DIR is substituted at test time. The test sets
+# `profile-substitute-env = true` so `${RUSTIC_SENTINEL_DIR}` is expanded by
+# rustic's profile loader before the hooks fire.
+
+[global]
+profile-substitute-env = true
+
+[global.hooks]
+run-before = ["/usr/bin/touch ${RUSTIC_SENTINEL_DIR}/global_before"]
+run-after = ["/usr/bin/touch ${RUSTIC_SENTINEL_DIR}/global_after"]
+
+[repository]
+repository = "${RUSTIC_HOOKS_REPO}"
+password = "${RUSTIC_PASSWORD}"
+no-cache = true
+
+[repository.hooks]
+run-before = ["/usr/bin/touch ${RUSTIC_SENTINEL_DIR}/repo_before"]
+run-after = ["/usr/bin/touch ${RUSTIC_SENTINEL_DIR}/repo_after"]
+
+[backup.hooks]
+run-before = ["/usr/bin/touch ${RUSTIC_SENTINEL_DIR}/backup_before"]
+run-after = ["/usr/bin/touch ${RUSTIC_SENTINEL_DIR}/backup_after"]
