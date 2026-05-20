@@ -3,6 +3,12 @@ name: Fedora RPM
 on:
   push:
     branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "packaging/rpm/**"
+      - ".github/workflows/rpm-fedora.yml"
   workflow_dispatch:
 
 env:

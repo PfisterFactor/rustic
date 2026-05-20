@@ -1,5 +1,22 @@
 name: Continuous Integration
 
+# Consolidated CI workflow.
+#
+# This file absorbs what used to be three separate workflow files:
+#   - lint-docs.yml  (dprint markdown + toml check)
+#   - audit.yml      (cargo-audit + cargo-deny, owner-gated)
+#   - compat.yml     (restic ⇄ rustic interop test)
+#
+# Keeping them as jobs inside one workflow gives us:
+#   - one status check ("Continuous Integration") to require in branch
+#     protection,
+#   - one concurrency group so a new push cancels the previous run for
+#     every job in lockstep,
+#   - one tag for the GitHub UI to render under each commit.
+#
+# Each job retains its original guards (e.g. the audit jobs stay
+# `repository_owner == 'rustic-rs'` so they remain no-ops on forks).
+
 on:
   pull_request:
     paths-ignore:
@@ -11,7 +28,8 @@ on:
     paths-ignore:
       - "**/*.md"
   schedule:
-    - cron: "0 0 * * 0"
+    # Daily 00:00 UTC for the security audit.
+    - cron: "0 0 * * *"
   merge_group:
     types: [checks_requested]
 
@@ -20,6 +38,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ---------------------------------------------------------------- lint
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
@@ -58,11 +77,20 @@ jobs:
       - name: Run clippy
         run: cargo clippy --locked --all-targets --features ${{ matrix.feature }} -- -D warnings
 
+  lint-docs:
+    # Was: .github/workflows/lint-docs.yml :: style.
+    name: Lint markdown + toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dprint/check@9cb3a2b17a8e606d37aae341e49df3654933fc23 # v2.3
+
+  # ---------------------------------------------------------------- test
   test:
     name: Test
     runs-on: ${{ matrix.job.os }}
     strategy:
-      # Don't fail fast, so we can actually see all the results
+      # Don't fail fast, so we can actually see all the results.
       fail-fast: false
       matrix:
         rust: [stable]
@@ -100,6 +128,58 @@ jobs:
         with:
           name: failed-snapshots-${{ matrix.job.os }}
           path: "**/snapshots/*.snap.new"
+
+  compat:
+    # Was: .github/workflows/compat.yml :: test.
+    # restic ⇄ rustic interop test. Windows is intentionally excluded
+    # (upstream FIXME — restic on Windows runner doesn't behave).
+    name: restic compat
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable]
+        feature: [release]
+        job:
+          - os: macos-latest
+          - os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        if: github.event_name != 'pull_request'
+        with:
+          fetch-depth: 0
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        if: github.event_name == 'pull_request'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Setup Restic
+        uses: rustic-rs/setup-restic@main
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # v1
+        with:
+          toolchain: stable
+
+      - name: Create fixtures
+        shell: bash
+        run: |
+          restic init
+          restic backup src
+          mv src/lib.rs lib.rs
+          restic backup src
+          mv lib.rs src/lib.rs
+        env:
+          RESTIC_REPOSITORY: ./tests/repository-fixtures/repo
+          RESTIC_PASSWORD: restic
+
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
+
+      - name: Run Cargo Test (restic interop)
+        run: cargo test -r --test repositories --features ${{ matrix.feature }} -- test_restic_latest_repo_with_rustic_passes --exact --show-output --ignored
+
   docs:
     name: Build docs
     runs-on: ${{ matrix.job.os }}
@@ -130,18 +210,91 @@ jobs:
       - name: Run Cargo Doc
         run: cargo doc --no-deps --all-features --workspace --examples
 
+  # --------------------------------------------------------------- audit
+  # The audit and cargo-deny jobs are owner-gated: they only do real work
+  # on the upstream rustic-rs repo. On forks they show as skipped, which
+  # is the same behavior as the previous stand-alone audit.yml workflow.
+  audit:
+    name: cargo-audit
+    if: ${{ github.repository_owner == 'rustic-rs' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2023-0071  # rsa thingy, ignored for now
+
+  cargo-deny:
+    name: cargo-deny
+    if: ${{ github.repository_owner == 'rustic-rs' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: EmbarkStudios/cargo-deny-action@30f817c6f72275c6d54dc744fbca09ebc958599f # v2
+        with:
+          command: check bans licenses sources
+
+  # ---------------------------------------------------------------- gate
+  # Aggregator for branch-protection: a single required check that goes
+  # green only if every job above either succeeded or was skipped on
+  # purpose (owner-gated audit jobs on forks).
   result:
     name: Result (CI)
+    if: always()
     runs-on: ubuntu-latest
     needs:
       - fmt
+      - typos
       - clippy
+      - lint-docs
       - test
+      - compat
       - docs
+      - audit
+      - cargo-deny
     steps:
-      - name: Mark the job as successful
-        run: exit 0
-        if: success()
-      - name: Mark the job as unsuccessful
-        run: exit 1
-        if: "!success()"
+      - name: Verify required jobs succeeded or were intentionally skipped
+        env:
+          FMT_RESULT: ${{ needs.fmt.result }}
+          TYPOS_RESULT: ${{ needs.typos.result }}
+          CLIPPY_RESULT: ${{ needs.clippy.result }}
+          LINT_DOCS_RESULT: ${{ needs.lint-docs.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          COMPAT_RESULT: ${{ needs.compat.result }}
+          DOCS_RESULT: ${{ needs.docs.result }}
+          AUDIT_RESULT: ${{ needs.audit.result }}
+          DENY_RESULT: ${{ needs.cargo-deny.result }}
+        run: |
+          set -euo pipefail
+          echo "fmt        : ${FMT_RESULT}"
+          echo "typos      : ${TYPOS_RESULT}"
+          echo "clippy     : ${CLIPPY_RESULT}"
+          echo "lint-docs  : ${LINT_DOCS_RESULT}"
+          echo "test       : ${TEST_RESULT}"
+          echo "compat     : ${COMPAT_RESULT}"
+          echo "docs       : ${DOCS_RESULT}"
+          echo "audit      : ${AUDIT_RESULT}"
+          echo "cargo-deny : ${DENY_RESULT}"
+          # These must all succeed.
+          for r in "${FMT_RESULT}" "${TYPOS_RESULT}" "${CLIPPY_RESULT}" \
+                   "${LINT_DOCS_RESULT}" "${TEST_RESULT}" "${COMPAT_RESULT}" \
+                   "${DOCS_RESULT}"; do
+            if [[ "${r}" != "success" ]]; then
+              echo "::error::a required CI job did not succeed: ${r}"
+              exit 1
+            fi
+          done
+          # These may skip on forks (owner-gated).
+          for r in "${AUDIT_RESULT}" "${DENY_RESULT}"; do
+            if [[ "${r}" != "success" && "${r}" != "skipped" ]]; then
+              echo "::error::audit job had unexpected result: ${r}"
+              exit 1
+            fi
+          done
+          echo "all required CI jobs are green"
